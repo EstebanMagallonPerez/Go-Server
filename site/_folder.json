@@ -1,0 +1,5 @@
+{
+	"header": "/header.html",
+	"footer": "/footer.html",
+	"compress":true
+}
