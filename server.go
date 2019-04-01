@@ -5,12 +5,11 @@ import (
 	"net/http"
 	"fmt"
 	"strings"
-	"bytes"
-	"compress/gzip"
 	"io/ioutil"
 	"os"
 	"time"
 	"encoding/json"
+	"mime"
 )
 
 type folderProperties struct {
@@ -25,11 +24,12 @@ type httpRequestData struct {
 	fileName string
 	fileType string
 	folderPath string
+	contentType string
 	properties folderProperties
 }
 
 
-var port = ":8080"
+var port = ":443"
 
 //define directories for the compressed and uncompressed files
 var baseDirectory = "./site"
@@ -41,6 +41,7 @@ var default_header   = "/header.html"
 var default_footer   = "/footer.html"
 
 
+var gzipBuff circularBuffer
 //initiate Response will determine if we should attempt to return a gzipped version of the file, or just send it as it is
 func parseUrl(data *httpRequestData){
 	var url  = data.request.URL.Path
@@ -52,6 +53,8 @@ func parseUrl(data *httpRequestData){
 	data.fileType = url[extensionIndex:len(url)]
 	data.fileName = url[fileIndex+1:extensionIndex]
 	data.folderPath = url[:fileIndex+1]
+	data.contentType = mime.TypeByExtension(data.fileType)
+
 	/*
 		TODO
 		Move this logic to a folder level so we do not need to pull the properties every time a file is accessed
@@ -59,11 +62,10 @@ func parseUrl(data *httpRequestData){
 	//Parse JSON, and store results into the requestData
 	content, err := ioutil.ReadFile(baseDirectory+data.folderPath + "_folder.json")
 	if err != nil {
+		//there is no _folder.json treat everything as default
 		data.properties.Header = default_header
 		data.properties.Footer = default_footer
 		data.properties.Compress = default_compress
-		fmt.Printf("%+v\n",data)
-		//there is no _folder.json treat everything as default
 		return
 	}
 	json.Unmarshal(content, &data.properties)
@@ -71,100 +73,39 @@ func parseUrl(data *httpRequestData){
 
 
 func initiateResponse(data *httpRequestData){
-	fmt.Printf("initiateResponse\n")
 	parseUrl(data)
-	if data.properties.Compress && strings.Contains(data.request.Header["Accept-Encoding"][0], "gzip"){
-		initiateGzip(data)
-	}else{
-		resolve(data)
-	}
-}
-
-func initiateGzip(data *httpRequestData){
-	fmt.Println("initiateGzip")
-	compFile, err := os.Stat(compressedDirectory + data.folderPath + data.fileName + data.fileType + ".gz")
-	//if compressed file doesnt exist... make it and serve the uncompressed file for now
-	if err != nil {
-		go buildGzip(data)
-		serveGzip(data)
-		return
-	}
+	//if file does not exist... dont bother with anything else, and return the 404 page
 	uncompFile, err := os.Stat(baseDirectory + data.folderPath + data.fileName + data.fileType)
 	if err != nil {
 		//return 404
-		fmt.Println(err)
+		if data.fileType == ".html"{
+			data.writer.WriteHeader(http.StatusNotFound)
+			http.ServeFile(data.writer, data.request, baseDirectory+"/404.html")
+		}else{
+			http.NotFound(data.writer,data.request)
+		}
 		return
 	}
-	//if compressed is newer than the uncompressed file
-	if compFile.ModTime().After(uncompFile.ModTime()){
-		serveGzip(data)
+	if data.properties.Compress && strings.Contains(data.request.Header["Accept-Encoding"][0], "gzip"){
+		initiateGzip(data,uncompFile.ModTime())
 	}else{
-		go buildGzip(data)
 		resolve(data)
 	}
 }
 
-func serveGzip(data *httpRequestData){
-	fmt.Println("serveGzip")
-	data.writer.Header().Set("Content-Encoding", "gzip")
-	compFile, err := os.Open(compressedDirectory+data.folderPath + data.fileName + data.fileType+".gz")
-	if err != nil {
-		fmt.Println(err)
-	}
-	defer compFile.Close()
-	http.ServeContent(data.writer, data.request, data.folderPath + data.fileName + data.fileType, time.Time{}, compFile)
-}
-
-//this will build the gzip or just point to the file if it already exists
-func buildGzip(data *httpRequestData){
-	fmt.Println("buildGzip")
-	if _, err := os.Stat(compressedDirectory+data.folderPath); os.IsNotExist(err) {
-		fmt.Println("making the directory")
-		os.MkdirAll(compressedDirectory+data.folderPath, 0444)
-	}
-
-	rawbytes, err := ioutil.ReadFile(baseDirectory+data.folderPath + data.fileName+data.fileType)
-
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	if data.fileType == ".html"{
-		fmt.Println("adding header and footer")
-		//prepend Header
-		if data.properties.Header != ""{
-			temp, err := ioutil.ReadFile(baseDirectory+data.properties.Header)
-
-			if err != nil {
-				fmt.Println(err)
-			}else{
-				rawbytes = append(temp,rawbytes...)	
-			}
-
-		}
-		if data.properties.Footer != ""{
-			temp, err := ioutil.ReadFile(baseDirectory+data.properties.Footer)
-
-			if err != nil {
-				fmt.Println(err)
-			}else{
-				rawbytes = append(rawbytes,temp...)
-			}
-		}
-	}
-
-	var buf bytes.Buffer
-	writer := gzip.NewWriter(&buf)
-	writer.Write(rawbytes)
-	writer.Close()
-
-	err = ioutil.WriteFile(compressedDirectory+data.folderPath + data.fileName + data.fileType+".gz", buf.Bytes(), 0444)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+func initiateGzip(data *httpRequestData, uncompTime time.Time){
+	compFile, err := os.Stat(compressedDirectory + data.folderPath + data.fileName + data.fileType + ".gz")
+	//if compressed file doesnt exist... make it and serve the uncompressed file for now
+	if err != nil || compFile.ModTime().Before(uncompTime){
+		gzipBuff.insert(data)
+		resolve(data)
+		return
+	}else{
+		serveGzip(data)
 	}
 }
+
+
 
 //this builds the full file from the template files
 func buildHTML(){
@@ -173,7 +114,10 @@ func buildHTML(){
 
 func resolve(data *httpRequestData){
 	rawbytes, err := ioutil.ReadFile(baseDirectory+data.folderPath + data.fileName+data.fileType)
-	fmt.Printf("resolve\n")
+	if err != nil {
+		fmt.Println(err)
+	}
+
 	if data.fileType == ".html"{
 		fmt.Println("adding header and footer")
 		//prepend Header
@@ -197,21 +141,35 @@ func resolve(data *httpRequestData){
 			}
 		}
 	}
-
-	outputUrl:= baseDirectory+data.folderPath + data.fileName + data.fileType
-	fmt.Println(outputUrl)
-	http.ServeFile(data.writer, data.request, outputUrl)
+	data.writer.Header().Set("Content-Type", data.contentType)
+	data.writer.Write(rawbytes)
 }
 
+func makeDir(path string){
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		os.MkdirAll(path, 0444)
+	}
+}
+
+func gzipHandler(){
+	//This runs on a separate thread, and will gzip files when the main thread requests it
+	//This handles scenarios where the same file is requested for compression in multiple scenarios, and will force only 1 compression request to be processed for that file instead of multiple.
+	for true{
+		if !gzipBuff.empty(){
+			temp :=gzipBuff.get()
+			fmt.Println(temp.fileName)
+			fmt.Println("starting the compression")
+			buildGzip(temp)
+			fmt.Println("finished the compression")
+			gzipBuff.pop()
+		}
+	}
+}
 func main() {
-	if _, err := os.Stat(baseDirectory); os.IsNotExist(err) {
-		fmt.Println("making the directory")
-		os.MkdirAll(baseDirectory, 0444)
-	}
-	if _, err := os.Stat(compressedDirectory); os.IsNotExist(err) {
-		fmt.Println("making the directory")
-		os.MkdirAll(compressedDirectory, 0444)
-	}
+	makeDir(baseDirectory)
+	makeDir(compressedDirectory)
+	gzipBuff.init(25)
+	go gzipHandler()
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		s := httpRequestData{writer: w, request: req}
 		initiateResponse(&s);
